@@ -1,0 +1,79 @@
+body.home-page {
+  background-color: #0f1014;
+}
+
+.home {
+  color: var(--text-light);
+  padding-bottom: 50px;
+  background: url("../assets/images/banners/home-background.jpg") no-repeat
+    center top / cover;
+}
+
+.home .container {
+  width: 95%;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.banner {
+  height: 75vh;
+  display: flex;
+  align-items: center;
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 30px;
+}
+
+.banner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background:
+    linear-gradient(to top, #0f1014, transparent),
+    linear-gradient(to right, rgba(0, 0, 0, 0.8), transparent);
+}
+
+.banner-content {
+  position: relative;
+  z-index: 10;
+  max-width: 700px;
+  padding-left: 5%;
+}
+
+.banner-content h1 {
+  font-size: 3.5rem;
+  margin-bottom: 15px;
+  line-height: 1.1;
+}
+
+.btn-watch {
+  display: inline-block;
+  margin-top: 15px;
+  padding: 12px 35px;
+  background: var(--primary-color);
+  color: black;
+  text-decoration: none;
+  border-radius: 5px;
+  font-weight: bold;
+  text-transform: uppercase;
+  transition: 0.3s;
+}
+
+.btn-watch:hover {
+  background: var(--primary-color-hover);
+}
+
+@media (max-width: 768px) {
+  .banner {
+    height: 60vh;
+  }
+
+  .banner-content {
+    padding: 0 16px;
+  }
+
+  .banner-content h1 {
+    font-size: 2rem;
+  }
+}

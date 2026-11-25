@@ -1,0 +1,33 @@
+﻿# Dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
+
+# Build outputs
+dist/
+build/
+
+# Cache
+.cache/
+
+# Tài liệu quản lý dự án (lưu ngoài repo)
+product_backlog.xlsx
+Chụp màn hình*.png

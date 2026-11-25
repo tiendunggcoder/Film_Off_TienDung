@@ -1,0 +1,78 @@
+<header id="header">
+  <div class="header-elements">
+    <button
+      type="button"
+      class="for-mobile menu-toggle"
+      aria-label="Mở menu"
+      aria-controls="main_menu"
+      aria-expanded="false"
+    >
+      <i class="fa-solid fa-bars"></i>
+    </button>
+    <button
+      type="button"
+      class="for-mobile search-toggle"
+      aria-label="Tìm kiếm"
+      aria-controls="search"
+    >
+      <i class="fa-solid fa-magnifying-glass"></i>
+    </button>
+
+    <a id="logo" href="index.html" title="Rophim">
+      <img src="./assets/images/logos/logo.svg" alt="RoPhim" />
+    </a>
+
+    <div id="search">
+      <div class="search-elements">
+        <div class="search-icon">
+          <i class="fa-solid fa-magnifying-glass"></i>
+        </div>
+        <input
+          id="main-search"
+          class="search-input"
+          placeholder="Tìm kiếm phim, diễn viên"
+          aria-label="Tìm kiếm phim, diễn viên"
+          autocomplete="off"
+        />
+      </div>
+    </div>
+
+    <div class="el-group">
+      <div id="main_menu">
+        <div class="menu-item"><a href="movies.html">Phim Lẻ</a></div>
+        <div class="menu-item"><a href="series.html">Phim Bộ</a></div>
+
+        <div class="menu-item menu-item-sub">
+          <div class="dropdown" id="nav-categories">
+            <a>Thể loại <i class="fa-solid fa-caret-down ms-2"></i></a>
+          </div>
+        </div>
+
+        <div class="menu-item menu-item-sub">
+          <div class="dropdown" id="nav-countries">
+            <a>Quốc gia <i class="fa-solid fa-caret-down ms-2"></i></a>
+          </div>
+        </div>
+
+        <div class="menu-item menu-item-sub">
+          <div class="dropdown" id="nav-more">
+            <a>Thêm <i class="fa-solid fa-caret-down ms-2"></i></a>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex-grow-1"></div>
+
+      <div id="main_user">
+        <a class="button-user button-login" href="login.html">
+          <div class="line-center">
+            <i class="fa-solid fa-user ms-1"></i>
+            <span>Thành viên</span>
+          </div>
+        </a>
+        <!-- Điền bởi setupAuthHeader() (js/main.js) khi đã đăng nhập — US-18 Sc2, US-19 Sc1 -->
+        <div class="user-menu" id="user-menu" hidden></div>
+      </div>
+    </div>
+  </div>
+</header>

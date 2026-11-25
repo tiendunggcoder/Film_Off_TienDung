@@ -1,0 +1,1302 @@
+// Trang xem phim: thông tin phim · trình phát · tập/phần/máy chủ · sidebar · thanh công cụ · bình luận.
+(() => {
+  const DESCRIPTION_LENGTH = 250;
+  const SKIP_SECONDS = 10;
+  const CONTROLS_HIDE_DELAY = 3000;
+  const COMMENT_MAX_LENGTH = 1000;
+  const TMDB_IMAGE_HOST = API_CONFIG.TMDB_IMAGE_HOST;
+  const NON_LATIN_PATTERN = /[぀-ヿ㐀-䶿一-鿿豈-﫿ｦ-ﾟ]/;
+  const CAST_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22", "#34495e"];
+
+  // Cài đặt trình phát được lưu bền vững (US-19 Sc2: giữ âm lượng, tắt đèn, tự chuyển tập)
+  const DEFAULT_PREFS = { volume: 1, lightsOff: false, autoNext: true };
+  function getUserPrefs() {
+    return { ...DEFAULT_PREFS, ...getFromStorage(STORAGE_KEYS.USER_PREFERENCES, {}) };
+  }
+  function setUserPref(name, value) {
+    saveToStorage(STORAGE_KEYS.USER_PREFERENCES, { ...getUserPrefs(), [name]: value });
+  }
+
+  const state = {
+    movie: null,
+    episode: "1",
+    server: 0,
+    selectedServer: 0,
+    hls: null,
+    player: null,
+    commentTab: "comments",
+    resumeAt: 0,
+  };
+
+  document.addEventListener("DOMContentLoaded", initWatchPage);
+
+  // Đồng bộ lịch sử xem lên server sau khi đã ghi local (US-51 — đa thiết bị).
+  // Fire-and-forget: không await, không block UI.
+  function syncHistoryToServer(movie, episode, progress) {
+    if (!isLoggedIn() || !movie) return;
+    saveMyHistory({
+      slug: movie.slug,
+      name: movie.name || "",
+      poster: movie.poster_url || movie.thumb_url || movie.poster || "",
+      episode: String(episode),
+      progress: Number(progress) || 0,
+    }).catch(() => {});
+  }
+
+  function initWatchPage() {
+    const params = new URLSearchParams(window.location.search);
+    const slug = params.get("slug");
+    state.episode = params.get("ep") || "1";
+    state.server = Math.max(0, parseInt(params.get("server") || "0", 10) || 0);
+    state.selectedServer = state.server;
+
+    setupToolbar();
+    setupEpisodeControls();
+    setupPlayerShortcuts();
+    setupCommentSection();
+    applyUserPreferences();
+
+    // Ghi lại tiến độ xem định kỳ (5s) và khi tạm dừng hoặc rời trang (US-52 Sc1)
+    const video = document.getElementById("hls-player");
+    const saveProgress = () => {
+      if (!state.movie || !video || !video.duration) return;
+      const progress = Math.floor(video.currentTime);
+      saveWatchHistory(state.movie, state.episode, progress);
+      // Đồng bộ lên server nếu đã đăng nhập (US-51: lịch sử xem đồng bộ đa thiết bị)
+      syncHistoryToServer(state.movie, state.episode, progress);
+    };
+    video?.addEventListener("timeupdate", throttle(saveProgress, 5000));
+    video?.addEventListener("pause", saveProgress);
+    window.addEventListener("pagehide", saveProgress);
+
+    if (!slug) {
+      showLoadFailure("Không tìm thấy phim. Đường dẫn thiếu mã phim.");
+      return;
+    }
+
+    loadMovie(slug);
+  }
+
+  function applyUserPreferences() {
+    const prefs = getUserPrefs();
+
+    // 1. Tự chuyển tập
+    const autoNextToggle = document.getElementById("auto-next-toggle");
+    if (autoNextToggle) {
+      autoNextToggle.checked = Boolean(prefs.autoNext);
+    }
+
+    // 2. Chế độ tắt đèn
+    if (prefs.lightsOff) {
+      document.body.classList.add("lights-off");
+      const lightsBtn = document.getElementById("lights-btn");
+      const label = lightsBtn?.querySelector("span");
+      if (label) label.textContent = "Bật đèn";
+    }
+  }
+
+  async function loadMovie(slug) {
+    const res = await getMovieDetail(slug);
+    const movie = res.data?.data?.item;
+
+    if (!res.success || !movie) {
+      const notFound = res.success || res.status === 404;
+      showLoadFailure(
+        notFound
+          ? "Không tìm thấy phim này. Có thể phim đã bị gỡ hoặc đường dẫn sai."
+          : "Không kết nối được máy chủ phim. Kiểm tra mạng rồi thử lại.",
+        notFound ? null : () => loadMovie(slug),
+      );
+      return;
+    }
+
+    hidePlayerMessage();
+    setMovieSectionsVisible(true);
+
+    movie.episodes = movie.episodes || [];
+    if (!movie.episodes[state.server]) {
+      state.server = 0;
+      state.selectedServer = 0;
+    }
+    state.movie = movie;
+
+    renderMovieInfo();
+    updateFavoriteButton();
+    renderVideo();
+    renderServerTabs();
+    renderSeasons();
+    renderEpisodes();
+    renderCast();
+    loadGallery();
+    loadRecommendations();
+    renderComments();
+
+    // Đọc vị trí xem trước đó TRƯỚC khi ghi đè (US-52, US-53)
+    const previous = getStoredList(STORAGE_KEYS.WATCH_HISTORY).find((h) => h.slug === movie.slug);
+    state.resumeAt =
+      previous && String(previous.episode) === String(state.episode) ? Number(previous.progress) || 0 : 0;
+    saveWatchHistory(movie, state.episode, state.resumeAt);
+    syncHistoryToServer(movie, state.episode, state.resumeAt);
+
+    // Ghi nhận lượt xem cho thống kê (US-58)
+    recordMovieView(movie.slug, state.episode);
+  }
+
+  // Không tải được phim: báo ngay trong khung video, ẩn các khu vực phụ thuộc dữ liệu phim.
+  function showLoadFailure(message, onRetry = null) {
+    setText("header-movie-title", "Không tải được phim");
+    setMovieSectionsVisible(false);
+    showPlayerMessage(message, onRetry);
+  }
+
+  function setMovieSectionsVisible(visible) {
+    const sections = document.querySelector(".content-wrapper");
+    if (sections) sections.hidden = !visible;
+  }
+
+  function showPlayerMessage(message, onRetry = null) {
+    const container = document.getElementById("player-container");
+    if (!container) return;
+    let box = container.querySelector(".player-message");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "player-message";
+      container.appendChild(box);
+    }
+    renderEmptyState(box, {
+      icon: "fa-solid fa-circle-exclamation",
+      message,
+      onRetry: onRetry
+        ? () => {
+            renderEmptyState(box, { icon: "fa-solid fa-spinner fa-spin", message: "Đang thử lại..." });
+            onRetry();
+          }
+        : null,
+    });
+  }
+
+  function hidePlayerMessage() {
+    document.querySelector("#player-container .player-message")?.remove();
+  }
+
+  function setText(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  }
+
+  function isSameEpisode(ep, value) {
+    const target = String(value).toLowerCase();
+    return (
+      String(ep.name).toLowerCase() === target ||
+      String(ep.slug).toLowerCase() === target
+    );
+  }
+
+  const SEASON_PATTERN = /(?:Phần|Mùa|Season)\s*(\d+)/i;
+
+  function getSeasonNumber(name) {
+    const match = String(name).match(SEASON_PATTERN);
+    return match ? parseInt(match[1], 10) : 1;
+  }
+
+  // "Nhiệm Vụ: Gia Đình Yozakura (Phần 2) (Yozakura-san…)" → "Nhiệm Vụ: Gia Đình Yozakura"
+  function getSeriesBaseName(name) {
+    return String(name)
+      .replace(new RegExp(SEASON_PATTERN.source, "gi"), "")
+      .split("(")[0]
+      .replace(/[\s:\u2013-]+$/, "")
+      .trim();
+  }
+
+  // ===== Thông tin phim =====
+
+  function renderMovieInfo() {
+    const movie = state.movie;
+    const totalEp = movie.episode_total || "??";
+    const currentEpCount = movie.episode_current || "??";
+
+    setText("movie-title", movie.name);
+    setText("header-movie-title", movie.name);
+    setText("movie-subtitle", movie.origin_name || movie.tmdb?.original_title || "");
+    setText("imdb-score", movie.imdb?.vote_average || movie.tmdb?.vote_average || "N/A");
+    setText("year", formatYear(movie.year));
+    setText("episode-info", `Tập ${totalEp}`);
+    setText("season-info", `Phần ${getSeasonNumber(movie.name)}`);
+    setText(
+      "sidebar-rating",
+      movie.tmdb?.vote_average ? Number(movie.tmdb.vote_average).toFixed(1) : "N/A",
+    );
+
+    const statusText = document.getElementById("status-text");
+    if (statusText) {
+      const isCompleted = currentEpCount === totalEp || movie.status === "completed";
+      const status = statusText.closest(".completion-status");
+      status?.classList.toggle("is-completed", isCompleted);
+      status?.classList.toggle("is-ongoing", !isCompleted);
+      const icon = status?.querySelector("i");
+      if (icon) icon.className = isCompleted ? "fas fa-check-circle" : "fas fa-clock";
+      statusText.textContent = `${isCompleted ? "Đã hoàn thành" : "Đang cập nhật"}: ${currentEpCount} / ${totalEp} tập`;
+    }
+
+    const descEl = document.getElementById("movie-description");
+    if (descEl) {
+      const text = stripHtml(movie.content);
+      const detailUrl = `./detail.html?slug=${encodeURIComponent(movie.slug)}`;
+      if (!text) {
+        descEl.textContent = "Đang cập nhật mô tả...";
+      } else if (text.length > DESCRIPTION_LENGTH) {
+        descEl.innerHTML = `${escapeHtml(text.substring(0, DESCRIPTION_LENGTH))}<a class="description-more-link" href="${detailUrl}" title="Xem thông tin chi tiết">...</a>`;
+      } else {
+        descEl.innerHTML = `${escapeHtml(text)} <a class="description-more-link-small" href="${detailUrl}" title="Xem thông tin chi tiết">[Chi tiết]</a>`;
+      }
+    }
+
+    const poster = document.getElementById("movie-poster");
+    if (poster) {
+      poster.onerror = () => {
+        poster.onerror = null;
+        poster.src = APP_CONFIG.DEFAULT_POSTER;
+      };
+      poster.src = getImageUrl(movie.poster_url || movie.thumb_url);
+      poster.alt = movie.name || "";
+    }
+
+    const genres = document.getElementById("movie-genres");
+    if (genres && movie.category) {
+      genres.innerHTML = movie.category
+        .map((c) => `<span class="genre-tag">${escapeHtml(c.name)}</span>`)
+        .join("");
+    }
+
+    document.title = `Xem ${movie.name} | ${APP_CONFIG.APP_NAME}`;
+  }
+
+  // ===== Trình phát =====
+
+  function renderVideo() {
+    const server = state.movie.episodes[state.server] || state.movie.episodes[0];
+    const ep = server?.server_data?.find((e) => isSameEpisode(e, state.episode)) || server?.server_data?.[0];
+    if (!ep) {
+      showPlayerMessage("Phim này hiện chưa có tập nào để phát. Vui lòng quay lại sau.");
+      return;
+    }
+    hidePlayerMessage();
+    state.episode = ep.name;
+
+    if (state.hls) {
+      state.hls.destroy();
+      state.hls = null;
+    }
+
+    const iframe = document.getElementById("video-iframe");
+    const video = document.getElementById("hls-player");
+    const qualitySelector = document.getElementById("quality-selector");
+    if (qualitySelector) qualitySelector.hidden = true;
+
+    const canUseHls = ep.link_m3u8 && ep.link_m3u8.includes(".m3u8") && video;
+
+    // Phát tiếp đúng giây sau khi tải metadata (US-53 Sc1)
+    const onResumeMetadata = () => {
+      if (state.resumeAt > 5 && video.duration && video.duration - state.resumeAt > 10) {
+        video.currentTime = state.resumeAt;
+        showToast(`Tiếp tục xem từ ${formatTime(state.resumeAt)}`);
+      }
+      state.resumeAt = 0;
+    };
+    video?.addEventListener("loadedmetadata", onResumeMetadata, { once: true });
+
+    if (canUseHls && window.Hls && Hls.isSupported()) {
+      showVideoElement(video, iframe);
+      playWithHlsJs(video, ep);
+    } else if (canUseHls && video.canPlayType("application/vnd.apple.mpegurl")) {
+      showVideoElement(video, iframe);
+      video.src = ep.link_m3u8;
+      video.addEventListener(
+        "error",
+        () => {
+          console.warn("Lỗi video native, chuyển sang iframe dự phòng");
+          showEmbedPlayer(ep.link_embed);
+        },
+        { once: true },
+      );
+      video.addEventListener("loadedmetadata", () => video.play().catch(() => {}), { once: true });
+      initCustomControls(video);
+    } else {
+      showEmbedPlayer(ep.link_embed);
+    }
+
+    const params = new URLSearchParams({ slug: state.movie.slug, ep: ep.name, server: state.server });
+    window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+  }
+
+  function showVideoElement(video, iframe) {
+    if (iframe) {
+      iframe.hidden = true;
+      iframe.src = "";
+    }
+    video.hidden = false;
+  }
+
+  function showEmbedPlayer(embedUrl) {
+    const iframe = document.getElementById("video-iframe");
+    const video = document.getElementById("hls-player");
+    const controls = document.getElementById("custom-controls");
+
+    state.player = null;
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.hidden = true;
+    }
+    if (controls) controls.hidden = true;
+    if (!iframe) return;
+
+    if (!embedUrl) {
+      iframe.hidden = true;
+      iframe.src = "";
+      const hasOtherServers = (state.movie?.episodes?.length || 0) > 1;
+      showPlayerMessage(
+        hasOtherServers
+          ? "Không phát được tập này trên máy chủ hiện tại. Hãy chọn máy chủ khác bên dưới."
+          : "Không phát được tập này. Nguồn phim đang lỗi, vui lòng thử lại sau.",
+      );
+      return;
+    }
+    iframe.hidden = false;
+    iframe.src = embedUrl;
+  }
+
+  function playWithHlsJs(video, ep) {
+    const hls = new Hls({ capLevelToPlayerSize: false, startLevel: -1 });
+    state.hls = hls;
+    hls.loadSource(ep.link_m3u8);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (!data.fatal) return;
+      console.warn("HLS fatal error, chuyển sang iframe:", data.type);
+      hls.destroy();
+      if (state.hls === hls) state.hls = null;
+      showEmbedPlayer(ep.link_embed);
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      setupQualitySelector(hls);
+      initCustomControls(video);
+    });
+
+    hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+      const label = document.getElementById("current-quality-label");
+      if (label && hls.autoLevelEnabled && hls.levels[data.level]) {
+        label.textContent = `Auto (${hls.levels[data.level].height}p)`;
+      }
+    });
+  }
+
+  function setupQualitySelector(hls) {
+    const selector = document.getElementById("quality-selector");
+    const currentBtn = document.getElementById("quality-current-btn");
+    const menu = document.getElementById("quality-menu");
+    const label = document.getElementById("current-quality-label");
+    if (!selector || !currentBtn || !menu) return;
+
+    const levels = Array.isArray(hls.levels) ? hls.levels : [];
+    const uniqueHeights = new Set(
+      levels
+        .map((level) => level.height)
+        .filter((h) => typeof h === "number" && h > 0),
+    );
+
+    // US-43 Sc3: Phim chỉ có 1 mức chất lượng (hoặc không có mức rõ ràng) -> ẩn nút chọn chất lượng.
+    if (levels.length <= 1 || uniqueHeights.size <= 1) {
+      selector.hidden = true;
+      return;
+    }
+    selector.hidden = false;
+
+    // Lọc các mức duy nhất theo độ phân giải, sắp xếp từ cao xuống thấp
+    const seenHeights = new Set();
+    const sortedLevels = levels
+      .map((level, index) => ({ height: level.height, index }))
+      .filter((level) => {
+        if (!level.height || seenHeights.has(level.height)) return false;
+        seenHeights.add(level.height);
+        return true;
+      })
+      .sort((a, b) => b.height - a.height);
+
+    menu.innerHTML =
+      `<div class="quality-item ${hls.autoLevelEnabled ? "active" : ""}" data-level="-1">Tự động (Auto)</div>` +
+      sortedLevels
+        .map(
+          (level) => `<div class="quality-item" data-level="${level.index}">
+            ${level.height}p${level.height >= 1080 ? ' <small class="quality-tag">FHD</small>' : ""}
+          </div>`,
+        )
+        .join("");
+    if (label) label.textContent = "Auto";
+
+    currentBtn.onclick = (e) => {
+      e.stopPropagation();
+      menu.classList.toggle("active");
+    };
+
+    menu.onclick = (e) => {
+      const item = e.target.closest(".quality-item");
+      if (!item) return;
+      const level = parseInt(item.dataset.level, 10);
+      hls.currentLevel = level;
+      menu.querySelectorAll(".quality-item").forEach((i) => i.classList.toggle("active", i === item));
+      if (label) label.textContent = level === -1 ? "Auto" : `${levels[level].height}p`;
+      menu.classList.remove("active");
+    };
+  }
+
+  // Gắn lại mỗi khi đổi nguồn video; dùng thuộc tính on* nên không bị nhân đôi.
+  function initCustomControls(video) {
+    const container = document.getElementById("player-container");
+    const controls = document.getElementById("custom-controls");
+    const playPauseBtn = document.getElementById("play-pause-btn");
+    const volumeBtn = document.getElementById("volume-btn");
+    const volumeSlider = document.getElementById("volume-slider");
+    const seekbar = document.getElementById("seekbar");
+    const seekbarProgress = document.getElementById("seekbar-progress");
+    const currentTimeEl = document.getElementById("current-time");
+    const durationTimeEl = document.getElementById("duration-time");
+    const fullscreenBtn = document.getElementById("fullscreen-btn");
+    const autoNextToggle = document.getElementById("auto-next-toggle");
+    if (!video || !controls) return;
+
+    controls.hidden = false;
+
+    const setPlayIcon = (icon) => {
+      playPauseBtn.innerHTML = `<i class="fas fa-${icon}"></i>`;
+    };
+    const togglePlay = () => {
+      if (video.paused) video.play().catch(() => {});
+      else video.pause();
+    };
+    const updateVolumeIcon = () => {
+      const icon = volumeBtn.querySelector("i");
+      if (video.volume === 0) icon.className = "fas fa-volume-mute";
+      else if (video.volume < 0.5) icon.className = "fas fa-volume-down";
+      else icon.className = "fas fa-volume-up";
+    };
+    const setVolume = (value) => {
+      video.volume = Math.min(1, Math.max(0, value));
+      volumeSlider.value = video.volume;
+      updateVolumeIcon();
+      setUserPref("volume", video.volume);
+    };
+
+    // Khôi phục mức âm lượng đã lưu (US-19 Sc2)
+    const savedPrefs = getUserPrefs();
+    setVolume(typeof savedPrefs.volume === "number" ? savedPrefs.volume : 1);
+
+    video.onplay = () => setPlayIcon("pause");
+    video.onpause = () => setPlayIcon("play");
+    playPauseBtn.onclick = togglePlay;
+    video.onclick = togglePlay;
+    document.getElementById("rewind-btn").onclick = () => (video.currentTime -= SKIP_SECONDS);
+    document.getElementById("forward-btn").onclick = () => (video.currentTime += SKIP_SECONDS);
+
+    volumeSlider.oninput = (e) => setVolume(parseFloat(e.target.value));
+    volumeBtn.onclick = () => {
+      if (video.volume > 0) {
+        video.dataset.lastVolume = video.volume;
+        setVolume(0);
+      } else {
+        setVolume(parseFloat(video.dataset.lastVolume) || 1);
+      }
+    };
+
+    video.ontimeupdate = () => {
+      if (!video.duration) return;
+      const percent = (video.currentTime / video.duration) * 100;
+      seekbar.value = percent;
+      seekbarProgress.style.width = `${percent}%`;
+      currentTimeEl.textContent = formatTime(video.currentTime);
+    };
+    video.onloadedmetadata = () => {
+      durationTimeEl.textContent = formatTime(video.duration);
+    };
+    seekbar.oninput = (e) => {
+      if (video.duration) video.currentTime = (e.target.value / 100) * video.duration;
+    };
+
+    fullscreenBtn.onclick = () => {
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+        return;
+      }
+      container.requestFullscreen().catch((err) => {
+        console.error("Fullscreen error:", err);
+        showToast("Trình duyệt không cho phép toàn màn hình", "error");
+      });
+    };
+    document.onfullscreenchange = () => {
+      fullscreenBtn.innerHTML = document.fullscreenElement
+        ? '<i class="fas fa-compress"></i>'
+        : '<i class="fas fa-expand"></i>';
+    };
+
+    video.onended = () => {
+      if (autoNextToggle.checked) playNextEpisode();
+      else setPlayIcon("redo");
+    };
+
+    let hideTimer;
+    container.onmousemove = () => {
+      controls.classList.add("active");
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        if (!video.paused) controls.classList.remove("active");
+      }, CONTROLS_HIDE_DELAY);
+    };
+
+    state.player = { video, togglePlay, setVolume };
+  }
+
+  function setupPlayerShortcuts() {
+    document.addEventListener("keydown", (e) => {
+      const player = state.player;
+      if (!player) return;
+      const target = e.target;
+      if (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      // Space trên nút đang focus đã tự "click" nút đó.
+      if (e.code === "Space" && target.tagName === "BUTTON") return;
+
+      const { video, togglePlay, setVolume } = player;
+      switch (e.code) {
+        case "Space":
+          e.preventDefault();
+          togglePlay();
+          break;
+        case "ArrowRight":
+          video.currentTime += SKIP_SECONDS;
+          break;
+        case "ArrowLeft":
+          video.currentTime -= SKIP_SECONDS;
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          setVolume(video.volume + 0.1);
+          break;
+        case "ArrowDown":
+          e.preventDefault();
+          setVolume(video.volume - 0.1);
+          break;
+      }
+    });
+  }
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds)) return "00:00";
+    const h = Math.floor(seconds / 3600);
+    const m = String(Math.floor((seconds % 3600) / 60)).padStart(2, "0");
+    const s = String(Math.floor(seconds % 60)).padStart(2, "0");
+    return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+  }
+
+  // ===== Tập / phần / máy chủ =====
+
+  function setupEpisodeControls() {
+    const seasonSelector = document.querySelector(".season-selector");
+    const seasonContent = document.getElementById("season-dropdown-content");
+
+    document.getElementById("season-toggle-btn")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = seasonContent.classList.toggle("show");
+      seasonSelector.classList.toggle("active", isOpen);
+    });
+
+    document.addEventListener("click", (e) => {
+      if (seasonSelector && !seasonSelector.contains(e.target)) {
+        seasonContent?.classList.remove("show");
+        seasonSelector.classList.remove("active");
+      }
+      document.getElementById("quality-menu")?.classList.remove("active");
+    });
+
+    document.getElementById("server-tabs")?.addEventListener("click", (e) => {
+      const btn = e.target.closest(".server-btn");
+      if (!btn) return;
+      state.selectedServer = parseInt(btn.dataset.serverIndex, 10);
+      renderServerTabs();
+      renderEpisodes();
+    });
+
+    document.getElementById("episodes-grid")?.addEventListener("click", (e) => {
+      const card = e.target.closest(".episode-card");
+      if (card) playEpisode(card.dataset.episode, state.selectedServer);
+    });
+  }
+
+  function renderServerTabs() {
+    const serverTabs = document.getElementById("server-tabs");
+    if (!serverTabs) return;
+    serverTabs.innerHTML = state.movie.episodes
+      .map(
+        (server, idx) => `
+        <button type="button" class="server-btn ${idx === state.selectedServer ? "active" : ""}" data-server-index="${idx}">
+          ${escapeHtml(server.server_name)}
+        </button>`,
+      )
+      .join("");
+  }
+
+  function renderEpisodes() {
+    const grid = document.getElementById("episodes-grid");
+    if (!grid) return;
+
+    const serverData = state.movie.episodes[state.selectedServer]?.server_data || [];
+    if (serverData.length === 0) {
+      grid.innerHTML = '<p class="no-data">Chưa có tập phim</p>';
+      return;
+    }
+
+    grid.innerHTML = serverData
+      .map((ep) => {
+        const isPlaying = isSameEpisode(ep, state.episode) && state.selectedServer === state.server;
+        return `<div class="episode-card ${isPlaying ? "active" : ""}" data-episode="${escapeHtml(ep.name)}">
+            <span class="ep-number">${escapeHtml(formatEpisodeName(ep.name))}</span>
+          </div>`;
+      })
+      .join("");
+  }
+
+  function playEpisode(episodeName, serverIdx) {
+    state.episode = episodeName;
+    state.server = serverIdx;
+    state.selectedServer = serverIdx;
+    state.resumeAt = 0; // Đổi tập mới -> bắt đầu từ 0 (US-52, US-53)
+    renderVideo();
+    renderServerTabs();
+    renderEpisodes();
+    saveWatchHistory(state.movie, state.episode, 0);
+    syncHistoryToServer(state.movie, state.episode, 0);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function playNextEpisode() {
+    const serverData = state.movie?.episodes[state.server]?.server_data || [];
+    const currentIndex = serverData.findIndex((e) => isSameEpisode(e, state.episode));
+    if (currentIndex !== -1 && currentIndex < serverData.length - 1) {
+      playEpisode(serverData[currentIndex + 1].name, state.server);
+    }
+  }
+
+  // Danh sách "Phần" được suy ra bằng cách tìm các phim cùng tên gốc — phimapi không có quan hệ mùa phim.
+  async function renderSeasons() {
+    const seasonList = document.getElementById("season-list");
+    const currentSeasonText = document.getElementById("current-season-text");
+    const seasonSelector = document.querySelector(".season-selector");
+    const dividerVertical = seasonSelector
+      ? seasonSelector.nextElementSibling
+      : null;
+    if (!seasonList) return;
+
+    const movieName = state.movie.name;
+    const currentSeasonNum = getSeasonNumber(movieName);
+    if (currentSeasonText) currentSeasonText.textContent = `Phần ${currentSeasonNum}`;
+
+    const baseName = getSeriesBaseName(movieName);
+    const res = await searchMovies(baseName);
+    if (!res.success) return;
+
+    const seasons = new Map();
+    // Phim đang xem phải luôn có trong danh sách
+    seasons.set(currentSeasonNum, state.movie.slug);
+
+    extractMovieItems(res)
+      .filter((m) => getSeriesBaseName(m.name).toLowerCase() === baseName.toLowerCase())
+      .forEach((m) => {
+        const num = getSeasonNumber(m.name);
+        if (!seasons.has(num)) seasons.set(num, m.slug);
+      });
+
+    // Chỉ hiện mục chọn phần khi có từ 2 phần trở lên (US-48 Sc1)
+    if (seasons.size < 2) {
+      if (seasonSelector) seasonSelector.hidden = true;
+      if (dividerVertical && dividerVertical.classList.contains("divider-vertical")) {
+        dividerVertical.hidden = true;
+      }
+      return;
+    }
+
+    // Có nhiều phần → hiện selector
+    if (seasonSelector) seasonSelector.hidden = false;
+    if (dividerVertical && dividerVertical.classList.contains("divider-vertical")) {
+      dividerVertical.hidden = false;
+    }
+
+    seasonList.innerHTML = [...seasons.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([num, slug]) => {
+        const isActive = num === currentSeasonNum;
+        const href = isActive ? "#" : `watch.html?slug=${encodeURIComponent(slug)}`;
+        return `<a href="${href}" class="season-item ${isActive ? "active" : ""}">Phần ${num}</a>`;
+      })
+      .join("");
+  }
+
+  // ===== Sidebar: diễn viên, hình ảnh, đề xuất =====
+
+  function isLatinName(name) {
+    return Boolean(name) && /[a-zA-Z]/.test(name) && !NON_LATIN_PATTERN.test(name);
+  }
+
+  async function renderCast() {
+    const grid = document.getElementById("cast-grid");
+    if (!grid) return;
+
+    const res = await getMoviePeoples(state.movie.slug);
+    const peoples = res.data?.data?.peoples || [];
+
+    if (res.success && peoples.length > 0) {
+      grid.innerHTML = peoples
+        .slice(0, 10)
+        .map((person) => {
+          const imgPath = person.profile_path
+            ? `${TMDB_IMAGE_HOST}/w185${person.profile_path}`
+            : APP_CONFIG.DEFAULT_AVATAR;
+          const candidates = [person.name, person.original_name, ...(person.also_known_as || [])];
+          const displayName = candidates.find(isLatinName) || person.original_name || person.name;
+          return `
+            <div class="cast-item">
+              <img src="${escapeHtml(imgPath)}" alt="${escapeHtml(displayName)}" class="cast-avatar" loading="lazy"
+                   onerror="this.onerror=null;this.src='${APP_CONFIG.DEFAULT_AVATAR}'">
+              <span class="cast-name">${escapeHtml(displayName)}<br><small class="cast-character">${escapeHtml(truncateText(person.character || "", 20))}</small></span>
+            </div>`;
+        })
+        .join("");
+      return;
+    }
+
+    const actors = (state.movie.actor || []).filter(isLatinName);
+    if (actors.length === 0) {
+      grid.innerHTML = '<p class="no-data">Đang cập nhật diễn viên</p>';
+      return;
+    }
+
+    grid.innerHTML = actors
+      .slice(0, 8)
+      .map(
+        (actor, idx) => `
+        <div class="cast-item">
+          <div class="cast-avatar cast-avatar-initial" style="background: ${CAST_COLORS[idx % CAST_COLORS.length]}">
+            ${escapeHtml(actor.charAt(0).toUpperCase())}
+          </div>
+          <span class="cast-name">${escapeHtml(actor)}</span>
+        </div>`,
+      )
+      .join("");
+  }
+
+  async function loadGallery() {
+    const grid = document.getElementById("gallery-grid");
+    if (!grid) return;
+
+    const res = await getMovieImages(state.movie.slug);
+    const images = res.data?.data?.images || [];
+    const gallery = [
+      ...images.filter((i) => i.type === "backdrop").slice(0, 6),
+      ...images.filter((i) => i.type === "poster").slice(0, 4),
+    ];
+
+    if (!res.success) {
+      grid.innerHTML = '<p class="no-data">Lỗi tải hình ảnh</p>';
+      return;
+    }
+    if (gallery.length === 0) {
+      grid.innerHTML = '<p class="no-data">Không có hình ảnh</p>';
+      return;
+    }
+
+    grid.innerHTML = gallery
+      .map((img) => {
+        const size = img.type === "backdrop" ? "w780" : "w342";
+        return `
+          <div class="gallery-item ${escapeHtml(img.type)}">
+            <img src="${escapeHtml(`${TMDB_IMAGE_HOST}/${size}${img.file_path}`)}" alt="Hình ảnh phim ${escapeHtml(state.movie.name)}" loading="lazy">
+          </div>`;
+      })
+      .join("");
+  }
+
+  async function loadRecommendations() {
+    const listId = "recommendations-list";
+    const list = document.getElementById(listId);
+    if (!list) return;
+
+    renderSkeleton(listId, 6);
+
+    const res = await getRecommendedMovies(state.movie.category || [], 6);
+    const movies = extractMovieItems(res)
+      .filter((m) => m.slug !== state.movie.slug)
+      .slice(0, 6);
+
+    list.innerHTML =
+      movies.length > 0
+        ? movies.map(createMovieCard).join("")
+        : `<p class="no-data">${res.success ? "Không có đề xuất" : "Lỗi tải đề xuất"}</p>`;
+  }
+
+  // ===== Thanh công cụ =====
+
+  function setupToolbar() {
+    const lightsBtn = document.getElementById("lights-btn");
+    lightsBtn?.addEventListener("click", () => {
+      const isOff = document.body.classList.toggle("lights-off");
+      const label = lightsBtn.querySelector("span");
+      if (label) label.textContent = isOff ? "Bật đèn" : "Tắt đèn";
+      setUserPref("lightsOff", isOff);
+    });
+
+    // Lưu tùy chọn tự động chuyển tập khi người dùng thay đổi (US-19 Sc2)
+    document.getElementById("auto-next-toggle")?.addEventListener("change", (e) => {
+      setUserPref("autoNext", e.target.checked);
+    });
+
+    document.getElementById("favorite-btn")?.addEventListener("click", async () => {
+      if (!state.movie) return;
+      if (await confirmLoginRequired()) return;
+      toggleFavorite(state.movie);
+      updateFavoriteButton();
+    });
+
+    document.getElementById("share-btn")?.addEventListener("click", async () => {
+      if (navigator.share) {
+        try {
+          await navigator.share({ title: state.movie?.name || "Xem phim", url: window.location.href });
+        } catch (e) {
+          // Người dùng đóng bảng chia sẻ — không phải lỗi.
+        }
+        return;
+      }
+      const success = await copyToClipboard(window.location.href);
+      showToast(success ? "Đã sao chép liên kết" : "Không sao chép được liên kết", success ? "success" : "error");
+    });
+  }
+
+  function updateFavoriteButton() {
+    const icon = document.querySelector("#favorite-btn i");
+    if (icon && state.movie) {
+      icon.className = isInFavorites(state.movie.slug) ? "fas fa-heart" : "far fa-heart";
+    }
+  }
+
+  // ===== Bình luận & đánh giá (DEV-1 — US-54, US-55, US-56) =====
+  let currentRatingScore = 10;
+
+  const DEMO_COMMENTS = [
+    { user: "ngiahan0407", avatar: "assets/images/defaults/default-avatar1.jpg", badges: [{ icon: "fas fa-infinity", tone: "gold" }], sentiment: "Tuyệt vời", time: "42 phút trước", content: "mêeeeee" },
+    { user: "Thanh Thảo", avatar: "assets/images/defaults/default-avatar2.jpg", badges: [{ icon: "fas fa-venus", tone: "pink" }], sentiment: "Tuyệt vời", time: "một ngày trước", content: "kết happy ending, ai cũng dễ thương, chờ tỏ tình mòn mỏi" },
+    { user: "Thu Lee Anh", avatar: "assets/images/defaults/default-avatar3.jpg", badges: [{ icon: "fas fa-venus", tone: "pink" }], sentiment: "Tuyệt vời", time: "một ngày trước", content: "Lâu lắm rồi mới tìm được phim hợp gu" },
+  ];
+
+  const DEMO_RATINGS = [
+    { user: "Minh Khôi", avatar: "assets/images/defaults/default-avatar4.jpg", badges: [], rating: 10, time: "2 giờ trước", content: "Phim quá đỉnh, 10/10 không bàn cãi!" },
+    { user: "Hải Yến", avatar: "assets/images/defaults/default-avatar5.jpg", badges: [{ icon: "fas fa-venus", tone: "pink" }], rating: 9, time: "5 giờ trước", content: "Cốt truyện hay, nhạc phim xuất sắc." },
+  ];
+
+  function formatCommentTime(isoString) {
+    if (!isoString) return "";
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return "";
+    const diffSec = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (diffSec < 60) return "vừa xong";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} phút trước`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} giờ trước`;
+    if (diffSec < 2592000) return `${Math.floor(diffSec / 86400)} ngày trước`;
+    return formatDate(isoString);
+  }
+
+  function setupCommentSection() {
+    const pills = document.querySelectorAll(".toggle-pill .pill-btn");
+    pills.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        pills.forEach((b) => b.classList.toggle("active", b === btn));
+        state.commentTab = btn.dataset.tab;
+        updateCommentFormUI();
+        renderComments();
+      });
+    });
+
+    const scrollToComments = () =>
+      document.getElementById("comments-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    document.getElementById("btn-rate-action")?.addEventListener("click", () => {
+      const ratePill = document.querySelector('.toggle-pill .pill-btn[data-tab="ratings"]');
+      if (ratePill) ratePill.click();
+      scrollToComments();
+    });
+    document.getElementById("btn-comment-scroll")?.addEventListener("click", () => {
+      const commentPill = document.querySelector('.toggle-pill .pill-btn[data-tab="comments"]');
+      if (commentPill) commentPill.click();
+      scrollToComments();
+    });
+
+    const input = document.getElementById("comment-input");
+    const counter = document.getElementById("comment-char-count");
+    input?.addEventListener("input", () => {
+      if (!counter) return;
+      counter.textContent = `${input.value.length} / ${COMMENT_MAX_LENGTH}`;
+      counter.classList.toggle("is-full", input.value.length >= COMMENT_MAX_LENGTH);
+    });
+
+    document.querySelector(".send-btn")?.addEventListener("click", handleSendCommentOrRating);
+
+    updateCommentFormUI();
+  }
+
+  function updateCommentFormUI() {
+    const isCommentTab = state.commentTab === "comments";
+    const input = document.getElementById("comment-input");
+    const spoilerToggle = document.querySelector(".spoiler-toggle");
+    const sendBtn = document.querySelector(".send-btn");
+    let ratingPicker = document.getElementById("rating-picker-box");
+
+    if (isCommentTab) {
+      if (input) input.placeholder = "Viết bình luận...";
+      if (spoilerToggle) spoilerToggle.style.display = "";
+      if (sendBtn) sendBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Gửi';
+      if (ratingPicker) ratingPicker.style.display = "none";
+    } else {
+      if (input) input.placeholder = "Viết cảm nhận của bạn về phim (tùy chọn)...";
+      if (spoilerToggle) spoilerToggle.style.display = "none";
+      if (sendBtn) sendBtn.innerHTML = '<i class="fas fa-star"></i> Gửi đánh giá';
+
+      if (!ratingPicker) {
+        ratingPicker = document.createElement("div");
+        ratingPicker.id = "rating-picker-box";
+        ratingPicker.className = "rating-picker-container";
+        const form = document.querySelector(".rich-comment-form");
+        if (form && input) {
+          form.insertBefore(ratingPicker, input);
+        }
+      }
+      if (ratingPicker) {
+        ratingPicker.style.display = "flex";
+        renderRatingPicker(ratingPicker);
+      }
+    }
+  }
+
+  function renderRatingPicker(container) {
+    container.innerHTML = `
+      <div class="rating-picker-label">
+        <span>Chọn điểm đánh giá:</span>
+        <span class="current-choice">${currentRatingScore} / 10 điểm</span>
+      </div>
+      <div class="rating-number-buttons">
+        ${[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+          .map(
+            (num) => `
+          <button type="button" class="rating-num-btn ${num === currentRatingScore ? "selected" : ""}" data-score="${num}">
+            ${num}
+          </button>`,
+          )
+          .join("")}
+      </div>
+    `;
+
+    container.querySelectorAll(".rating-num-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        currentRatingScore = parseInt(btn.dataset.score, 10) || 10;
+        container.querySelectorAll(".rating-num-btn").forEach((b) => {
+          b.classList.toggle("selected", b === btn);
+        });
+        const choice = container.querySelector(".current-choice");
+        if (choice) choice.textContent = `${currentRatingScore} / 10 điểm`;
+      });
+    });
+  }
+
+  async function handleSendCommentOrRating() {
+    const input = document.getElementById("comment-input");
+    const content = input ? input.value.trim() : "";
+    const isCommentTab = state.commentTab === "comments";
+
+    if (!isLoggedIn()) {
+      showToast(isCommentTab ? "Vui lòng đăng nhập để bình luận" : "Vui lòng đăng nhập để đánh giá", "info");
+      return;
+    }
+
+    if (!state.movie?.slug) return;
+
+    if (isCommentTab) {
+      if (!content) {
+        showToast("Vui lòng nhập nội dung bình luận", "warning");
+        return;
+      }
+
+      const spoilerInput = document.querySelector(".spoiler-toggle input");
+      const isSpoiler = Boolean(spoilerInput?.checked);
+
+      const res = await postMovieComment(state.movie.slug, {
+        content,
+        isSpoiler,
+        episode: state.episode || "1",
+      });
+
+      if (!res.success) {
+        showToast(res.error || "Không thể gửi bình luận, vui lòng thử lại", "error");
+        return;
+      }
+
+      showToast("Gửi bình luận thành công!", "success");
+      if (input) input.value = "";
+      const counter = document.getElementById("comment-char-count");
+      if (counter) counter.textContent = `0 / ${COMMENT_MAX_LENGTH}`;
+      if (spoilerInput) spoilerInput.checked = false;
+
+      await renderComments();
+    } else {
+      const res = await postMovieRating(state.movie.slug, {
+        score: currentRatingScore,
+        content: content || null,
+      });
+
+      if (!res.success) {
+        showToast(res.error || "Không thể gửi đánh giá, vui lòng thử lại", "error");
+        return;
+      }
+
+      showToast("Cảm ơn bạn đã đánh giá phim!", "success");
+      if (input) input.value = "";
+      const counter = document.getElementById("comment-char-count");
+      if (counter) counter.textContent = `0 / ${COMMENT_MAX_LENGTH}`;
+
+      await renderComments();
+    }
+  }
+
+  async function renderComments() {
+    const list = document.getElementById("rich-comment-list");
+    const tabTitle = document.querySelector(".cmt-tab-btn");
+    if (!list) return;
+
+    if (!state.movie?.slug) {
+      renderDemoData(state.commentTab === "comments");
+      return;
+    }
+
+    const isCommentTab = state.commentTab === "comments";
+    const session = getAuthSession();
+    const currentUser = session?.user || null;
+
+    if (isCommentTab) {
+      const res = await getMovieComments(state.movie.slug, 1);
+
+      if (res.error === "BACKEND_NOT_CONFIGURED") {
+        renderDemoData(isCommentTab);
+        return;
+      }
+
+      if (!res.success) {
+        renderEmptyState(list, {
+          icon: "fa-solid fa-triangle-exclamation",
+          message: "Không tải được bình luận.",
+          onRetry: () => renderComments(),
+        });
+        return;
+      }
+
+      const items = res.data?.data?.items || res.data?.items || [];
+      const total = res.data?.data?.pagination?.total ?? res.data?.pagination?.total ?? items.length;
+
+      if (tabTitle) {
+        tabTitle.innerHTML = `<i class="fas fa-comment-alt"></i> Bình luận ( <span id="comment-count-display">${total}</span> )`;
+      }
+
+      if (items.length === 0) {
+        renderEmptyState(list, {
+          icon: "fas fa-comment-dots",
+          message: "Chưa có bình luận nào. Hãy là người đầu tiên bình luận!",
+        });
+        return;
+      }
+
+      list.innerHTML = items
+        .map((c) => {
+          const user = c.user || {};
+          const isSpoiler = Boolean(c.isSpoiler);
+          const time = formatCommentTime(c.createdAt);
+          const epTag = c.episode ? `<span class="ep-tag">${escapeHtml(formatEpisodeName(c.episode))}</span>` : "";
+          const isOwner = currentUser && (currentUser.id === user.id || currentUser.role === "admin" || currentUser.role === "super_admin");
+          const deleteBtn = isOwner
+            ? `<div class="action-link delete-link" data-id="${escapeHtml(c.id)}"><i class="fas fa-trash-alt"></i> Xóa</div>`
+            : "";
+          const isLiked = Boolean(c.isLiked);
+          const likeCount = Number(c.likeCount) || 0;
+          const likeCountText = likeCount > 0 ? likeCount : "";
+
+          return `
+          <div class="comment-item-rich ${isSpoiler ? "is-spoiler" : ""}" id="comment-${escapeHtml(c.id)}">
+            <img src="${escapeHtml(user.avatarUrl || "assets/images/defaults/default-avatar1.jpg")}" class="user-avatar" alt="${escapeHtml(user.username || "Thành viên")}">
+            <div class="comment-content-wrapper">
+              <div class="comment-header">
+                <span class="user-name">${escapeHtml(user.username || "Thành viên")}</span>
+                ${epTag}
+                <span class="time-text">${escapeHtml(time)}</span>
+              </div>
+              ${isSpoiler ? `<div class="spoiler-warning-tag"><i class="fas fa-exclamation-triangle"></i> Cảnh báo tiết lộ nội dung — Bấm để xem</div>` : ""}
+              <div class="comment-body">${escapeHtml(c.content)}</div>
+              <div class="comment-actions">
+                <div class="action-link like-link ${isLiked ? "liked" : ""}" data-id="${escapeHtml(c.id)}"><i class="fas fa-thumbs-up"></i> Thích <span class="like-count">${escapeHtml(likeCountText)}</span></div>
+                ${deleteBtn}
+              </div>
+            </div>
+          </div>`;
+        })
+        .join("");
+
+      list.querySelectorAll(".comment-item-rich.is-spoiler").forEach((item) => {
+        const warning = item.querySelector(".spoiler-warning-tag");
+        const body = item.querySelector(".comment-body");
+        const toggleReveal = () => item.classList.toggle("revealed");
+        warning?.addEventListener("click", toggleReveal);
+        body?.addEventListener("click", toggleReveal);
+      });
+
+      list.querySelectorAll(".delete-link").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          const id = btn.dataset.id;
+          if (!id) return;
+          if (confirm("Bạn có chắc chắn muốn xóa bình luận này?")) {
+            const delRes = await deleteComment(id);
+            if (delRes.success) {
+              showToast("Đã xóa bình luận", "success");
+              const el = document.getElementById(`comment-${id}`);
+              if (el) el.remove();
+            } else {
+              showToast(delRes.error || "Không thể xóa bình luận", "error");
+            }
+          }
+        });
+      });
+
+      list.querySelectorAll(".like-link").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!isLoggedIn()) {
+            showToast("Vui lòng đăng nhập để thả tim bình luận", "info");
+            return;
+          }
+          const id = btn.dataset.id;
+          if (!id) return;
+          const likeRes = await likeComment(id);
+          if (likeRes.success) {
+            const { liked, likeCount } = likeRes.data?.data || likeRes.data || {};
+            btn.classList.toggle("liked", Boolean(liked));
+            const countEl = btn.querySelector(".like-count");
+            if (countEl) countEl.textContent = likeCount > 0 ? likeCount : "";
+          } else {
+            showToast(likeRes.error || "Không thể thả tim, thử lại sau", "error");
+          }
+        });
+      });
+    } else {
+      const res = await getMovieRatings(state.movie.slug, 1);
+
+      if (res.error === "BACKEND_NOT_CONFIGURED") {
+        renderDemoData(isCommentTab);
+        return;
+      }
+
+      if (!res.success) {
+        renderEmptyState(list, {
+          icon: "fa-solid fa-triangle-exclamation",
+          message: "Không tải được đánh giá.",
+          onRetry: () => renderComments(),
+        });
+        return;
+      }
+
+      const dataObj = res.data?.data || res.data || {};
+      const items = dataObj.items || [];
+      const summary = dataObj.summary || { average: 0, total: 0 };
+      const myScore = dataObj.myScore;
+
+      if (myScore && !currentRatingScore) {
+        currentRatingScore = myScore;
+      }
+
+      const sidebarRating = document.getElementById("sidebar-rating");
+      if (sidebarRating && summary.total > 0) {
+        sidebarRating.textContent = summary.average;
+      }
+
+      if (tabTitle) {
+        tabTitle.innerHTML = `<i class="fas fa-star"></i> Đánh giá ( <span id="comment-count-display">${summary.total}</span> | TB: ${summary.average}/10 )`;
+      }
+
+      if (items.length === 0) {
+        renderEmptyState(list, {
+          icon: "fas fa-star-half-alt",
+          message: "Chưa có đánh giá nào. Hãy là người đầu tiên chấm điểm bộ phim!",
+        });
+        return;
+      }
+
+      list.innerHTML = items
+        .map((r) => {
+          const user = r.user || {};
+          const time = formatCommentTime(r.createdAt || r.updatedAt);
+          const contentHtml = r.content ? `<div class="comment-body">${escapeHtml(r.content)}</div>` : "";
+
+          return `
+          <div class="comment-item-rich">
+            <img src="${escapeHtml(user.avatarUrl || "assets/images/defaults/default-avatar1.jpg")}" class="user-avatar" alt="${escapeHtml(user.username || "Thành viên")}">
+            <div class="comment-content-wrapper">
+              <div class="comment-header">
+                <span class="rating-score-badge"><i class="fas fa-star"></i> ${escapeHtml(r.score)}/10</span>
+                <span class="user-name">${escapeHtml(user.username || "Thành viên")}</span>
+                <span class="time-text">${escapeHtml(time)}</span>
+              </div>
+              ${contentHtml}
+            </div>
+          </div>`;
+        })
+        .join("");
+    }
+  }
+
+  function renderDemoData(isCommentTab) {
+    const list = document.getElementById("rich-comment-list");
+    const tabTitle = document.querySelector(".cmt-tab-btn");
+    if (!list) return;
+
+    const data = isCommentTab ? DEMO_COMMENTS : DEMO_RATINGS;
+    if (tabTitle) {
+      tabTitle.innerHTML = `<i class="fas fa-comment-alt"></i> ${isCommentTab ? "Bình luận" : "Đánh giá"} ( <span id="comment-count-display">${data.length}</span> )`;
+    }
+
+    list.innerHTML = data
+      .map((c) => {
+        const badges = (c.badges || [])
+          .map((b) => `<i class="${escapeHtml(b.icon)} comment-badge comment-badge-${escapeHtml(b.tone)}"></i>`)
+          .join("");
+        const sentiment = c.rating
+          ? `<span class="sentiment-badge sentiment-good"><i class="fas fa-star"></i> ${escapeHtml(c.rating)}/10</span>`
+          : `<span class="sentiment-badge sentiment-awesome"><i class="fas fa-fire-alt"></i> ${escapeHtml(c.sentiment || "Hay")}</span>`;
+
+        return `
+        <div class="comment-item-rich">
+          <img src="${escapeHtml(c.avatar || "assets/images/defaults/default-avatar1.jpg")}" class="user-avatar" alt="${escapeHtml(c.user)}">
+          <div class="comment-content-wrapper">
+            <div class="comment-header">
+              ${sentiment}
+              <span class="user-name">${escapeHtml(c.user)}</span>
+              ${badges}
+              <span class="time-text">${escapeHtml(c.time || "")}</span>
+            </div>
+            <div class="comment-body">${escapeHtml(c.content)}</div>
+          </div>
+        </div>`;
+      })
+      .join("");
+  }
+})();
